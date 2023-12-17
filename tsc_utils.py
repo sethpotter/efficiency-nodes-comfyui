@@ -216,7 +216,7 @@ def globals_cleanup(prompt):
                     loaded_objects[key].remove(tup)
                     ###print(f'Deleted tuple at index {i} in {key} in loaded_objects because its id array became empty.')
 
-def load_checkpoint(ckpt_name, id, output_vae=True, cache=None, cache_overwrite=True, ckpt_type="ckpt"):
+def load_checkpoint(ckpt_name, id, output_vae=True, cache=None, cache_overwrite=True, ckpt_type="ckpt", ckpt_config=None):
     global loaded_objects
 
     # Create copies of the arguments right at the start
@@ -228,8 +228,19 @@ def load_checkpoint(ckpt_name, id, output_vae=True, cache=None, cache_overwrite=
 
     for entry in loaded_objects[ckpt_type]:
         if entry[0] == ckpt_name:
-            _, model, clip, vae, ids = entry
+            _, model_config, model, clip, vae, ids = entry
             cache_full = cache and len([entry for entry in loaded_objects[ckpt_type] if id in entry[-1]]) >= cache
+
+            # Accounts for all other elements in the config node.
+            config_changed = not (model_config and ckpt_config and all(
+                model_config_elem == ckpt_config_elem
+                for model_config_elem, ckpt_config_elem in zip(model_config, ckpt_config)
+            ))
+
+            # If the config has changed, we need to clear the checkpoint from the cache.
+            if config_changed:
+                clear_cache(id, cache, ckpt_type)
+                break
 
             if cache_full:
                 clear_cache(id, cache, ckpt_type)
@@ -242,8 +253,28 @@ def load_checkpoint(ckpt_name, id, output_vae=True, cache=None, cache_overwrite=
         ckpt_path = ckpt_name
     else:
         ckpt_path = folder_paths.get_full_path("checkpoints", ckpt_name)
-    with suppress_output():
-        out = comfy.sd.load_checkpoint_guess_config(ckpt_path, output_vae, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
+
+    # If checkpoint is loading with a config
+    if ckpt_config:
+        from comfy_extras.nodes_model_advanced import RescaleCFG
+
+        config_path = folder_paths.get_full_path("configs", ckpt_config[0])
+        rescale_value = ckpt_config[1]
+
+        with suppress_output():
+            # Use of deprecated function.
+            temp_out = comfy.sd.load_checkpoint(config_path, ckpt_path, output_vae, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
+
+        # Optional rescaling for the cfg of this model.
+        if rescale_value > 0:
+            rescale = RescaleCFG()
+            rescaled_model = rescale.patch(temp_out[0], ckpt_config[1])
+            out = (rescaled_model[0],) + temp_out[1:]
+        else:
+            out = temp_out
+    else:
+        with suppress_output():
+            out = comfy.sd.load_checkpoint_guess_config(ckpt_path, output_vae, output_clip=True, embedding_directory=folder_paths.get_folder_paths("embeddings"))
 
     model = out[0]
     clip = out[1]
@@ -252,7 +283,7 @@ def load_checkpoint(ckpt_name, id, output_vae=True, cache=None, cache_overwrite=
     if cache:
         cache_list = [entry for entry in loaded_objects[ckpt_type] if id in entry[-1]]
         if len(cache_list) < cache:
-            loaded_objects[ckpt_type].append((ckpt_name, model, clip, vae, [id]))
+            loaded_objects[ckpt_type].append((ckpt_name, ckpt_config, model, clip, vae, [id]))
         else:
             clear_cache(id, cache, ckpt_type)
             if cache_overwrite:
@@ -263,14 +294,14 @@ def load_checkpoint(ckpt_name, id, output_vae=True, cache=None, cache_overwrite=
                         if not e[-1]:
                             loaded_objects[ckpt_type].remove(e)
                         break
-                loaded_objects[ckpt_type].append((ckpt_name, model, clip, vae, [id]))
+                loaded_objects[ckpt_type].append((ckpt_name, ckpt_config, model, clip, vae, [id]))
 
     return model, clip, vae
 
 def get_bvae_by_ckpt_name(ckpt_name):
     for ckpt in loaded_objects["ckpt"]:
         if ckpt[0] == ckpt_name:
-            return ckpt[3]  # return 'bvae' variable
+            return ckpt[4]  # return 'bvae' variable
     return None  # return None if no match is found
 
 def load_vae(vae_name, id, cache=None, cache_overwrite=False):
@@ -316,7 +347,7 @@ def load_vae(vae_name, id, cache=None, cache_overwrite=False):
 
     return vae
 
-def load_lora(lora_params, ckpt_name, id, cache=None, ckpt_cache=None, cache_overwrite=False):
+def load_lora(lora_params, ckpt_name, id, cache=None, ckpt_cache=None, cache_overwrite=False, ckpt_config=None):
     global loaded_objects
 
     # Create copies of the arguments right at the start
@@ -328,8 +359,19 @@ def load_lora(lora_params, ckpt_name, id, cache=None, ckpt_cache=None, cache_ove
         # Convert to sets and compare
         if set(entry[0]) == set(lora_params) and entry[1] == ckpt_name:
 
-            _, _, lora_model, lora_clip, ids = entry
+            _, _, model_config, lora_model, lora_clip, ids = entry
             cache_full = cache and len([entry for entry in loaded_objects["lora"] if id in entry[-1]]) >= cache
+
+            # Accounts for all other elements in the config node.
+            config_changed = not (model_config and ckpt_config and all(
+                model_config_elem == ckpt_config_elem
+                for model_config_elem, ckpt_config_elem in zip(model_config, ckpt_config)
+            ))
+
+            # If the config has changed, we need to clear the checkpoint from the cache.
+            if config_changed:
+                clear_cache(id, cache, "lora")
+                break
 
             if cache_full:
                 clear_cache(id, cache, "lora")
@@ -339,7 +381,7 @@ def load_lora(lora_params, ckpt_name, id, cache=None, ckpt_cache=None, cache_ove
             # Additional cache handling for 'ckpt' just like in 'load_checkpoint' function
             for ckpt_entry in loaded_objects["ckpt"]:
                 if ckpt_entry[0] == ckpt_name:
-                    _, _, _, _, ckpt_ids = ckpt_entry
+                    _, _, _, _, _, ckpt_ids = ckpt_entry
                     ckpt_cache_full = ckpt_cache and len(
                         [ckpt_entry for ckpt_entry in loaded_objects["ckpt"] if id in ckpt_entry[-1]]) >= ckpt_cache
 
@@ -367,13 +409,13 @@ def load_lora(lora_params, ckpt_name, id, cache=None, ckpt_cache=None, cache_ove
 
     # Unpack lora parameters from the first element of the list for now
     lora_name, strength_model, strength_clip = lora_params[0]
-    ckpt, clip, _ = load_checkpoint(ckpt_name, id, cache=ckpt_cache)
+    ckpt, clip, _ = load_checkpoint(ckpt_name, id, cache=ckpt_cache, ckpt_config=ckpt_config)
 
     lora_model, lora_clip = recursive_load_lora(lora_params, ckpt, clip, id, ckpt_cache, cache_overwrite, folder_paths)
 
     if cache:
         if len([entry for entry in loaded_objects["lora"] if id in entry[-1]]) < cache:
-            loaded_objects["lora"].append((lora_params, ckpt_name, lora_model, lora_clip, [id]))
+            loaded_objects["lora"].append((lora_params, ckpt_name, ckpt_config, lora_model, lora_clip, [id]))
         else:
             clear_cache(id, cache, "lora")
             if cache_overwrite:
@@ -385,7 +427,7 @@ def load_lora(lora_params, ckpt_name, id, cache=None, ckpt_cache=None, cache_ove
                         if not e[-1]:
                             loaded_objects["lora"].remove(e)
                         break
-                loaded_objects["lora"].append((lora_params, ckpt_name, lora_model, lora_clip, [id]))
+                loaded_objects["lora"].append((lora_params, ckpt_name, ckpt_config, lora_model, lora_clip, [id]))
 
     return lora_model, lora_clip
 
