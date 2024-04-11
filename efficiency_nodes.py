@@ -568,14 +568,14 @@ class TSC_KSampler:
                         end_at_step = steps
 
                     # Perform base model sampling
-                    add_noise = return_with_leftover_noise = True
+                    add_noise = return_with_leftover_noise = "enable"
                     samples = KSamplerAdvanced().sample(model, add_noise, seed, steps, cfg, sampler_name, scheduler,
                                                         positive, negative, latent_image, start_at_step, end_at_step,
                                                         return_with_leftover_noise, denoise=1.0)[0]
 
                     # Perform refiner model sampling
                     if refiner_model and end_at_step < steps:
-                        add_noise = return_with_leftover_noise = False
+                        add_noise = return_with_leftover_noise = "disable"
                         samples = KSamplerAdvanced().sample(refiner_model, add_noise, seed, steps, cfg + REFINER_CFG_OFFSET,
                                                             sampler_name, scheduler, refiner_positive, refiner_negative,
                                                             samples, end_at_step, steps,
@@ -631,6 +631,19 @@ class TSC_KSampler:
                             store_ksampler_results("image", my_unique_id, images)
                         images = ImageUpscaleWithModel().upscale(pixel_upscale_model, images)[0]
                         images = ImageScaleBy().upscale(images, "nearest-exact", upscale_by/4)[0]
+                    elif upscale_type == "both":
+                        for _ in range(iterations):
+                            if images is None:
+                                images = vae_decode_latent(vae, samples, vae_decode)
+                                store_ksampler_results("image", my_unique_id, images)
+                            images = ImageUpscaleWithModel().upscale(pixel_upscale_model, images)[0]
+                            images = ImageScaleBy().upscale(images, "nearest-exact", upscale_by/4)[0]
+
+                            samples = vae_encode_image(vae, images, vae_decode)
+                            upscaled_latent_image = latent_upscale_function().upscale(samples, latent_upscaler, 1)[0]
+                            samples = KSampler().sample(latent_upscale_model, hires_seed, hires_steps, cfg, sampler_name, scheduler,
+                                                                positive, negative, upscaled_latent_image, denoise=hires_denoise)[0]
+                            images = None # set to None when samples is updated
 
                 # ------------------------------------------------------------------------------------------------------
                 # Check if "tile" exists in the script after main sampling has taken place
@@ -1156,19 +1169,33 @@ class TSC_KSampler:
                 elif var_type == "Positive Prompt S/R":
                     search_txt, replace_txt = var
                     if replace_txt != None:
-                        positive_prompt = (positive_prompt[1].replace(search_txt, replace_txt, 1), positive_prompt[1])
+                        # check if we are in the Y loop after the X loop
+                        if positive_prompt[2] is not None:
+                            positive_prompt = (positive_prompt[2].replace(search_txt, replace_txt, 1), positive_prompt[1], positive_prompt[2])
+                        else:
+                            positive_prompt = (positive_prompt[1].replace(search_txt, replace_txt, 1), positive_prompt[1], positive_prompt[1].replace(search_txt, replace_txt, 1))
                     else:
-                        positive_prompt = (positive_prompt[1], positive_prompt[1])
+                        if positive_prompt[2] is not None:
+                            positive_prompt = (positive_prompt[2], positive_prompt[1], positive_prompt[2])
+                        else:
+                            positive_prompt = (positive_prompt[1], positive_prompt[1], positive_prompt[1])
                         replace_txt = search_txt
                     text = f"{replace_txt}"
 
                 # If var_type is "Negative Prompt S/R", update negative_prompt and generate labels
                 elif var_type == "Negative Prompt S/R":
                     search_txt, replace_txt = var
-                    if replace_txt:
-                        negative_prompt = (negative_prompt[1].replace(search_txt, replace_txt, 1), negative_prompt[1])
+                    if replace_txt != None:
+                        # check if we are in the Y loop after the X loop
+                        if negative_prompt[2] is not None:
+                            negative_prompt = (negative_prompt[2].replace(search_txt, replace_txt, 1), negative_prompt[1], negative_prompt[2])
+                        else:
+                            negative_prompt = (negative_prompt[1].replace(search_txt, replace_txt, 1), negative_prompt[1], negative_prompt[1].replace(search_txt, replace_txt, 1))
                     else:
-                        negative_prompt = (negative_prompt[1], negative_prompt[1])
+                        if negative_prompt[2] is not None:
+                            negative_prompt = (negative_prompt[2], negative_prompt[1], negative_prompt[2])
+                        else:
+                            negative_prompt = (negative_prompt[1], negative_prompt[1], negative_prompt[1])
                         replace_txt = search_txt
                     text = f"(-) {replace_txt}"
 
@@ -1490,6 +1517,10 @@ class TSC_KSampler:
 
             # Fill Plot Rows (X)
             for X_index, X in enumerate(X_value):
+                # add a none value in the positive prompt memory.
+                # the tuple is composed of (actual prompt, original prompte before S/R, prompt after X S/R)
+                positive_prompt = (positive_prompt[0], positive_prompt[1], None)
+                negative_prompt = (negative_prompt[0], negative_prompt[1], None)
 
                 # Define X parameters and generate labels
                 add_noise, seed, steps, start_at_step, end_at_step, return_with_leftover_noise, cfg,\
@@ -2337,7 +2368,7 @@ class TSC_XYplot:
             Y_value = [""]
 
         # If types are the same exit. If one isn't "Nothing", print error
-        if X_type != "XY_Capsule" and (X_type == Y_type):
+        if X_type != "XY_Capsule" and (X_type == Y_type) and X_type not in ["Positive Prompt S/R", "Negative Prompt S/R"]:
             if X_type != "Nothing":
                 print(f"{error('XY Plot Error:')} X and Y input types must be different.")
             return (None,)
@@ -4023,7 +4054,7 @@ class TSC_HighRes_Fix:
     @classmethod
     def INPUT_TYPES(cls):
 
-        return {"required": {"upscale_type": (["latent","pixel"],),
+        return {"required": {"upscale_type": (["latent","pixel","both"],),
                              "hires_ckpt_name": (["(use same)"] + folder_paths.get_filename_list("checkpoints"),),
                              "latent_upscaler": (cls.latent_upscalers,),
                              "pixel_upscaler": (cls.pixel_upscalers,),
@@ -4123,6 +4154,17 @@ class TSC_HighRes_Fix:
             elif upscale_type == "pixel":
                 pixel_upscale_model = UpscaleModelLoader().load_model(pixel_upscaler)[0]
 
+            elif upscale_type == "both":
+                latent_upscale_function = LatentUpscaleBy
+                latent_upscaler = self.default_latent_upscalers[0]
+                pixel_upscale_model = UpscaleModelLoader().load_model(pixel_upscaler)[0]
+
+                if hires_ckpt_name == "(use same)":
+                    clear_cache(my_unique_id, 0, "ckpt")
+                else:
+                    latent_upscale_model, _, _ = \
+                        load_checkpoint(hires_ckpt_name, my_unique_id, output_vae=False, cache=1, cache_overwrite=True)
+
         control_net = ControlNetLoader().load_controlnet(control_net_name)[0] if use_controlnet is True else None
 
         # Construct the script output
@@ -4167,6 +4209,26 @@ class TSC_Tiled_Upscaler:
         return (script,)
 
 ########################################################################################################################
+# TSC LoRA Stack to String converter
+class TSC_LoRA_Stack2String:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"lora_stack": ("LORA_STACK",)}}
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("LoRA string",)
+    FUNCTION = "convert"
+    CATEGORY = "Efficiency Nodes/Misc"
+
+    def convert(self, lora_stack):
+        """
+        Converts a list of tuples into a single space-separated string.
+        Each tuple contains (STR, FLOAT1, FLOAT2) and is converted to the format "<lora:STR:FLOAT1:FLOAT2>".
+        """
+        output = ' '.join(f"<lora:{tup[0]}:{tup[1]}:{tup[2]}>" for tup in lora_stack)
+        return (output,)
+
+########################################################################################################################
 # NODE MAPPING
 NODE_CLASS_MAPPINGS = {
     "KSampler (Efficient)": TSC_KSampler,
@@ -4204,11 +4266,13 @@ NODE_CLASS_MAPPINGS = {
     "Image Overlay": TSC_ImageOverlay,
     "Noise Control Script": TSC_Noise_Control_Script,
     "HighRes-Fix Script": TSC_HighRes_Fix,
-    "Tiled Upscaler Script": TSC_Tiled_Upscaler
+    "Tiled Upscaler Script": TSC_Tiled_Upscaler,
+    "LoRA Stack to String converter": TSC_LoRA_Stack2String
 }
 
 ########################################################################################################################
-# Add AnimateDiff Script based off Kosinkadink's Nodes (https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved)
+# Add AnimateDiff Script based off Kosinkadink's Nodes (https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved) deprecated
+"""
 if os.path.exists(os.path.join(custom_nodes_dir, "ComfyUI-AnimateDiff-Evolved")):
     printout = "Attempting to add 'AnimatedDiff Script' Node (ComfyUI-AnimateDiff-Evolved add-on)..."
     print(f"{message('Efficiency Nodes:')} {printout}", end="")
@@ -4248,6 +4312,7 @@ if os.path.exists(os.path.join(custom_nodes_dir, "ComfyUI-AnimateDiff-Evolved"))
 
     except Exception:
         print(f"\r{message('Efficiency Nodes:')} {printout}{error('Failed!')}")
+        """
 
 ########################################################################################################################
 # Simpleeval Nodes (https://github.com/danthedeckie/simpleeval)
